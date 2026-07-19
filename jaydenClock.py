@@ -1,61 +1,120 @@
-#!/usr/bin/env python3
-"""
-Terminal Text Rotator
-Cycles through text snippets every minute with configurable font styles and positioning.
+"""Terminal Text Rotator — JSON edition
+Loads quotes from data.json keyed by time (HH:MM).
+At the start of each new minute the matching quote is displayed.
+
+data.json format (array of objects):
+  [
+    {
+      "time":       "HH:MM",
+      "timeString": "One past midnight",
+      "quote":      "The actual quote text.",
+      "author":     "Author Name",
+      "title":      "Source Title"
+    },
+    ...
+  ]
+
 Controls:
-  n / p   - next / previous text manually
+  n / p   - next / previous entry manually
   f       - cycle font style
   a       - cycle alignment (left / center / right)
   v       - cycle vertical position (top / middle / bottom)
-  e       - edit current text inline
-  +/-     - increase / decrease interval (in seconds)
+  r       - reload data.json from disk
   q       - quit
 """
 
 import curses
 import time
+import json
+import os
 import threading
+from datetime import datetime
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-TEXTS = [
-    "The quick brown fox jumps over the lazy dog.",
-    "To be, or not to be — that is the question.",
-    "All that glitters is not gold.",
-    "In the beginning was the Word.",
-    "Not all those who wander are lost.",
-    "It was the best of times, it was the worst of times.",
-]
+DATA_FILE = os.path.join(os.path.dirname("/Users/skyefuller/Downloads/data.json"), "data.json")
+
 
 FONT_STYLES = [
-    ("Normal",    curses.A_NORMAL),
-    ("Bold",      curses.A_BOLD),
-    ("Dim",       curses.A_DIM),
-    ("Underline", curses.A_UNDERLINE),
-    ("Reverse",   curses.A_REVERSE),
-    ("Blink",     curses.A_BLINK),
+    ("Normal",         curses.A_NORMAL),
+    ("Bold",           curses.A_BOLD),
+    ("Dim",            curses.A_DIM),
+    ("Underline",      curses.A_UNDERLINE),
+    ("Reverse",        curses.A_REVERSE),
+    ("Blink",          curses.A_BLINK),
     ("Bold+Underline", curses.A_BOLD | curses.A_UNDERLINE),
     ("Bold+Reverse",   curses.A_BOLD | curses.A_REVERSE),
 ]
 
-ALIGNMENTS   = ["left", "center", "right"]
-V_POSITIONS  = ["top", "middle", "bottom"]
-DEFAULT_INTERVAL = 60   # seconds
+ALIGNMENTS  = ["left", "center", "right"]
+V_POSITIONS = ["top", "middle", "bottom"]
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+
+def load_data():
+    """Load and index data.json. Returns (entries_list, by_time_dict, error_str)."""
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+        by_time = {e["time"]: e for e in entries if "time" in e}
+        return entries, by_time, None
+    except FileNotFoundError:
+        return [], {}, f"data.json not found at: {DATA_FILE}"
+    except json.JSONDecodeError as exc:
+        return [], {}, f"JSON parse error: {exc}"
+
+
+def format_entry(entry):
+    """Turn a JSON entry into display strings."""
+    time_str    = entry.get("timeString", entry.get("time", ""))
+    quote       = entry.get("quote", "")
+    author      = entry.get("author", "")
+    title       = entry.get("title", "")
+    attribution = f"— {author}" if author else ""
+    if title:
+        attribution += f', "{title}"'
+    return time_str, quote, attribution
+
+
+def current_hhmm():
+    return datetime.now().strftime("%H:%M")
+
+
+def find_entry_for_now(entries, by_time):
+    """Return entry matching current HH:MM, or closest earlier one."""
+    now = current_hhmm()
+    if now in by_time:
+        return by_time[now]
+    times   = sorted(by_time.keys())
+    earlier = [t for t in times if t <= now]
+    if earlier:
+        return by_time[earlier[-1]]
+    return entries[-1] if entries else None
+
+
+def entry_index(entries, entry):
+    try:
+        return entries.index(entry)
+    except ValueError:
+        return 0
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
 
+entries, by_time, load_error = load_data()
+_start = find_entry_for_now(entries, by_time)
+
 state = {
-    "text_idx":    0,
-    "style_idx":   1,          # Bold by default
-    "align_idx":   1,          # center
-    "vpos_idx":    1,          # middle
-    "interval":    DEFAULT_INTERVAL,
-    "countdown":   DEFAULT_INTERVAL,
-    "texts":       list(TEXTS),
-    "dirty":       True,       # force redraw
-    "editing":     False,
-    "edit_buf":    "",
+    "entries":    entries,
+    "by_time":    by_time,
+    "load_error": load_error,
+    "entry_idx":  entry_index(entries, _start) if _start else 0,
+    "style_idx":  1,
+    "align_idx":  1,
+    "vpos_idx":   1,
+    "last_hhmm":  current_hhmm(),
+    "dirty":      True,
 }
 
 lock = threading.Lock()
@@ -63,38 +122,10 @@ lock = threading.Lock()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def compute_xy(stdscr, text, align, vpos):
-    """Return (y, x) for the text given alignment and vertical position."""
-    rows, cols = stdscr.getmaxyx()
-    text_len   = len(text)
-
-    if align == "left":
-        x = 1
-    elif align == "right":
-        x = max(1, cols - text_len - 1)
-    else:                          # center
-        x = max(1, (cols - text_len) // 2)
-
-    if vpos == "top":
-        y = 1
-    elif vpos == "bottom":
-        y = max(1, rows - 4)
-    else:                          # middle
-        y = max(1, (rows - 1) // 2)
-
-    return y, x
-
-
 def wrap_text(text, max_width):
-    """Simple word-wrap: returns list of lines."""
-    words  = text.split()
-    lines  = []
-    current = ""
+    words, lines, current = text.split(), [], ""
     for w in words:
-        if current:
-            candidate = current + " " + w
-        else:
-            candidate = w
+        candidate = (current + " " + w).strip()
         if len(candidate) <= max_width:
             current = candidate
         else:
@@ -106,91 +137,105 @@ def wrap_text(text, max_width):
     return lines or [""]
 
 
+def x_for_line(line, align, cols):
+    if align == "left":   return 2
+    if align == "right":  return max(2, cols - len(line) - 2)
+    return max(2, (cols - len(line)) // 2)
+
+
+def base_y(rows, num_lines, vpos):
+    if vpos == "top":    return 2
+    if vpos == "bottom": return max(2, rows - 3 - num_lines)
+    return max(2, (rows - num_lines) // 2)
+
+
+def safe_addstr(stdscr, y, x, text, attr=curses.A_NORMAL):
+    rows, cols = stdscr.getmaxyx()
+    text = text[:max(0, cols - x - 1)]
+    if 0 < y < rows - 1 and x >= 0:
+        try:
+            stdscr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+
+# ── Drawing ────────────────────────────────────────────────────────────────────
+
 def draw_screen(stdscr, s):
     rows, cols = stdscr.getmaxyx()
     stdscr.erase()
-
-    # ── border ──
     try:
         stdscr.border()
     except curses.error:
         pass
 
-    # ── current text ──
-    text       = s["texts"][s["text_idx"]]
     style_name, style_attr = FONT_STYLES[s["style_idx"]]
-    align      = ALIGNMENTS[s["align_idx"]]
-    vpos       = V_POSITIONS[s["vpos_idx"]]
+    align = ALIGNMENTS[s["align_idx"]]
+    vpos  = V_POSITIONS[s["vpos_idx"]]
+    max_w = max(10, cols - 4)
 
-    max_w      = max(10, cols - 4)
-    lines      = wrap_text(text, max_w)
-    base_y, _  = compute_xy(stdscr, lines[0], align, vpos)
+    if s["load_error"]:
+        safe_addstr(stdscr, rows // 2,     2, s["load_error"], curses.A_BOLD)
+        safe_addstr(stdscr, rows // 2 + 1, 2, "Press 'r' to reload data.json")
+    elif not s["entries"]:
+        safe_addstr(stdscr, rows // 2, 2, "No entries found in data.json", curses.A_BOLD)
+    else:
+        entry = s["entries"][s["entry_idx"]]
+        time_str, quote, attribution = format_entry(entry)
 
-    for i, line in enumerate(lines):
-        if align == "left":
-            x = 2
-        elif align == "right":
-            x = max(2, cols - len(line) - 2)
-        else:
-            x = max(2, (cols - len(line)) // 2)
-        y = base_y + i
-        if 0 < y < rows - 1:
-            try:
-                stdscr.addstr(y, x, line, style_attr)
-            except curses.error:
-                pass
+        time_lines  = wrap_text(time_str,    max_w) if time_str    else []
+        quote_lines = wrap_text(quote,       max_w) if quote       else []
+        attr_lines  = wrap_text(attribution, max_w) if attribution else []
 
-    # ── status bar (bottom) ──
-    bar_y = rows - 2
-    if bar_y > 0:
-        interval   = s["interval"]
-        countdown  = max(0, s["countdown"])
-        status = (
-            f" [{s['text_idx']+1}/{len(s['texts'])}] "
-            f"Style:{style_name}  "
-            f"Align:{align}  "
-            f"Pos:{vpos}  "
-            f"Next:{countdown}s/{interval}s "
+        # Assemble with blank separator lines
+        all_lines = (
+            time_lines
+            + ([""] if time_lines and quote_lines else [])
+            + quote_lines
+            + ([""] if attr_lines else [])
+            + attr_lines
         )
-        status = status[:cols - 2]
-        try:
-            stdscr.addstr(bar_y, 1, status, curses.A_DIM)
-        except curses.error:
-            pass
 
-    # ── help bar (very bottom) ──
-    help_y = rows - 1
-    if help_y > 0:
-        help_str = " n/p:next/prev  f:font  a:align  v:vpos  e:edit  +/-:speed  q:quit "
-        help_str = help_str[:cols - 2]
-        try:
-            stdscr.addstr(help_y, 0, help_str, curses.A_REVERSE)
-        except curses.error:
-            pass
+        time_end  = len(time_lines)
+        quote_end = time_end + (1 if time_lines and quote_lines else 0) + len(quote_lines)
+        start_y   = base_y(rows, len(all_lines), vpos)
 
-    # ── edit mode overlay ──
-    if s["editing"]:
-        prompt = f" Edit text (Enter=save, Esc=cancel): {s['edit_buf']}_"
-        mid_y  = rows // 2
-        try:
-            stdscr.addstr(mid_y, 1, prompt[:cols - 2], curses.A_BOLD | curses.A_REVERSE)
-        except curses.error:
-            pass
+        for i, line in enumerate(all_lines):
+            y = start_y + i
+            x = x_for_line(line, align, cols)
+            if i < time_end:
+                safe_addstr(stdscr, y, x, line, curses.A_BOLD)       # timeString
+            elif i < quote_end:
+                safe_addstr(stdscr, y, x, line, style_attr)          # quote
+            else:
+                safe_addstr(stdscr, y, x, line, curses.A_UNDERLINE)   # attribution
+
+    # status bar
+    now    = current_hhmm()
+    total  = len(s["entries"])
+    idx    = s["entry_idx"] + 1
+    status = f" [{idx}/{total}]  Style:{style_name}  Align:{align}  Pos:{vpos}  Clock:{now} "
+    safe_addstr(stdscr, rows - 2, 1, status[:cols - 2], curses.A_DIM)
+
+    # help bar
+    help_str = " n/p:next/prev  f:font  a:align  v:vpos  r:reload  q:quit "
+    safe_addstr(stdscr, rows - 1, 0, help_str[:cols - 1], curses.A_REVERSE)
 
     stdscr.refresh()
 
 
-# ── Countdown thread ───────────────────────────────────────────────────────────
+# ── Clock thread ───────────────────────────────────────────────────────────────
 
-def countdown_thread(s, lk, stop_event):
+def clock_thread(s, lk, stop_event):
     while not stop_event.is_set():
         time.sleep(1)
+        now = current_hhmm()
         with lk:
-            if not s["editing"]:
-                s["countdown"] -= 1
-                if s["countdown"] <= 0:
-                    s["text_idx"] = (s["text_idx"] + 1) % len(s["texts"])
-                    s["countdown"] = s["interval"]
+            if now != s["last_hhmm"]:
+                s["last_hhmm"] = now
+                entry = find_entry_for_now(s["entries"], s["by_time"])
+                if entry:
+                    s["entry_idx"] = entry_index(s["entries"], entry)
                 s["dirty"] = True
 
 
@@ -199,10 +244,10 @@ def countdown_thread(s, lk, stop_event):
 def main(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
-    stdscr.timeout(200)          # refresh every 200 ms
+    stdscr.timeout(250)
 
     stop_event = threading.Event()
-    t = threading.Thread(target=countdown_thread, args=(state, lock, stop_event), daemon=True)
+    t = threading.Thread(target=clock_thread, args=(state, lock, stop_event), daemon=True)
     t.start()
 
     while True:
@@ -215,62 +260,36 @@ def main(stdscr):
                 state["dirty"] = False
 
         key = stdscr.getch()
-
         if key == -1:
             continue
 
         with lock:
             s = state
 
-            # ── quit ──
             if key in (ord("q"), ord("Q")):
                 stop_event.set()
                 return
-
-            # ── editing mode ──
-            if s["editing"]:
-                if key in (curses.KEY_ENTER, 10, 13):
-                    if s["edit_buf"].strip():
-                        s["texts"][s["text_idx"]] = s["edit_buf"].strip()
-                    s["editing"] = False
-                    s["edit_buf"] = ""
-                    curses.curs_set(0)
-                elif key == 27:   # Esc
-                    s["editing"] = False
-                    s["edit_buf"] = ""
-                    curses.curs_set(0)
-                elif key == curses.KEY_BACKSPACE or key == 127:
-                    s["edit_buf"] = s["edit_buf"][:-1]
-                elif 32 <= key < 127:
-                    s["edit_buf"] += chr(key)
-                s["dirty"] = True
-                continue
-
-            # ── normal mode ──
-            if key in (ord("n"), ord("N")):
-                s["text_idx"] = (s["text_idx"] + 1) % len(s["texts"])
-                s["countdown"] = s["interval"]
+            elif key in (ord("n"), ord("N")):
+                if s["entries"]:
+                    s["entry_idx"] = (s["entry_idx"] + 1) % len(s["entries"])
             elif key in (ord("p"), ord("P")):
-                s["text_idx"] = (s["text_idx"] - 1) % len(s["texts"])
-                s["countdown"] = s["interval"]
+                if s["entries"]:
+                    s["entry_idx"] = (s["entry_idx"] - 1) % len(s["entries"])
             elif key in (ord("f"), ord("F")):
                 s["style_idx"] = (s["style_idx"] + 1) % len(FONT_STYLES)
             elif key in (ord("a"), ord("A")):
                 s["align_idx"] = (s["align_idx"] + 1) % len(ALIGNMENTS)
             elif key in (ord("v"), ord("V")):
                 s["vpos_idx"] = (s["vpos_idx"] + 1) % len(V_POSITIONS)
-            elif key in (ord("e"), ord("E")):
-                s["editing"]  = True
-                s["edit_buf"] = s["texts"][s["text_idx"]]
-                curses.curs_set(1)
-            elif key == ord("+"):
-                s["interval"]  = min(3600, s["interval"] + 5)
-                s["countdown"] = min(s["countdown"], s["interval"])
-            elif key == ord("-"):
-                s["interval"]  = max(5, s["interval"] - 5)
-                s["countdown"] = min(s["countdown"], s["interval"])
+            elif key in (ord("r"), ord("R")):
+                new_entries, new_by_time, err = load_data()
+                s["entries"]    = new_entries
+                s["by_time"]    = new_by_time
+                s["load_error"] = err
+                entry = find_entry_for_now(new_entries, new_by_time)
+                s["entry_idx"]  = entry_index(new_entries, entry) if entry else 0
             elif key == curses.KEY_RESIZE:
-                pass   # just redraw
+                pass
 
             s["dirty"] = True
 
